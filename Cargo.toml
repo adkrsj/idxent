@@ -1,0 +1,28 @@
+[package]
+name = "idxent"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "findent-server"
+path = "src/findent/server.rs"
+
+[[bin]]
+name = "findent-client"
+path = "src/findent/client.rs"
+
+[dependencies]
+tokio = { version="1.53.1", features = ["full"] }
+tokio-stream = "0.1.19"
+prost = "0.14.4"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+reqwest = "0.13.5"
+html2text = "0.17.1"
+rusty = "0.6.0"
+prost-types = "0.14.4"
+
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+grpc-protobuf-build = "0.9.0"
