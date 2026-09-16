@@ -3,12 +3,12 @@ use std::fs;
 
 use tonic::Request;
 
-use findent::entity_finder_client::EntityFinderClient;
-use findent::{FindEntityRequest};
+use extrent::entity_extractor_client::EntityExtractorClient;
+use extrent::{ExtractEntityRequest};
 
-pub mod findent
+pub mod extrent
 {
-    include!("generated/findent.rs");
+    include!("generated/extrent.rs");
 }
 
 
@@ -36,21 +36,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("entity_types: {}", entity_types.join(":"));
 
-    let findent_rpc_addr_str: String = env::var("FINDENT_RPC_ADDR").unwrap_or("[::1]:10000".to_string());
-    let findent_rpc_connect_str = format!("http://{}", findent_rpc_addr_str);
+    let extrent_rpc_addr_str: String = env::var("EXTRENT_RPC_ADDR").unwrap_or("[::1]:10000".to_string());
+    let extrent_rpc_connect_str = format!("http://{}", extrent_rpc_addr_str);
 
-    let findent_return_sentence_str : String = env::var("FINDENT_RPC_ADDR").unwrap_or(String::from("0"));
-    let findent_return_sentence : bool = findent_return_sentence_str.parse().unwrap_or(0) != 0;
+    let return_sentence_str : String = env::var("EXTRENT_RETURN_SEQUENCE").unwrap_or(String::from("0"));
+    let return_sentence : bool = return_sentence_str.parse().unwrap_or(0) != 0;
 
-    let mut client = EntityFinderClient::connect(findent_rpc_connect_str).await?;
+    let mut client = EntityExtractorClient::connect(extrent_rpc_connect_str).await?;
 
-    println!("*** SIMPLE RPC: find_entity ***");
+    println!("*** SIMPLE RPC: extract_entity ***");
 
     let response = client
-        .find_entity(Request::new(FindEntityRequest {
+        .extract_entity(Request::new(ExtractEntityRequest {
             text: text,
             entity_types: entity_types,
-            return_sentence: findent_return_sentence,
+            return_sentence: return_sentence,
         }))
         .await?;
     println!("RESPONSE = {response:?}");

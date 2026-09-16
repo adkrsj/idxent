@@ -4,19 +4,19 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use findent::entity_finder_server::{EntityFinder, EntityFinderServer};
-use findent::{FindEntityRequest, NamedEntityRef, FindEntityResponse };
+use extrent::entity_extractor_server::{EntityExtractor, EntityExtractorServer};
+use extrent::{ExtractEntityRequest, NamedEntityRef, ExtractEntityResponse };
 
 use rusty::{Language};
 
-pub mod findent
+pub mod extrent
 {
-    include!("generated/findent.rs");
+    include!("generated/extrent.rs");
 }
 
 
 #[derive(Debug)]
-pub struct EntityFinderService
+pub struct EntityExtractorService
 {
     rusty_nlp_model: Arc<rusty::Language>,
 }
@@ -37,10 +37,10 @@ macro_rules! handle_rusty_result_error
 }
 
 #[tonic::async_trait]
-impl EntityFinder for EntityFinderService
+impl EntityExtractor for EntityExtractorService
 {
-    async fn find_entity(&self, request: Request<FindEntityRequest>) -> Result<Response<FindEntityResponse>, Status> {
-        println!("find_entity = {:?}", request);
+    async fn extract_entity(&self, request: Request<ExtractEntityRequest>) -> Result<Response<ExtractEntityResponse>, Status> {
+        println!("extract_entity = {:?}", request);
 
         let text : &str = request.get_ref().text.as_str();
         let ent_types : &Vec<String> = &request.get_ref().entity_types;
@@ -63,9 +63,9 @@ impl EntityFinder for EntityFinderService
                 }
             ).collect();
 
-        let find_entity_response = FindEntityResponse{ entity_refs : entity_refs };
+        let extract_entity_response = ExtractEntityResponse{ entity_refs : entity_refs };
 
-        Ok(Response::new(find_entity_response))
+        Ok(Response::new(extract_entity_response))
     }
 }
 
@@ -80,15 +80,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
         |error|{ panic!("Failed loading spaCy model {}: {}", spacy_model_name, error) } );
     println!("Loaded spaCy model: {spacy_model_name}");
 
-    let findent_rpc_addr_str: String = env::var("FINDENT_RPC_ADDR").unwrap_or("[::1]:10000".to_string());
-    let findent_rpc_addr : std::net::SocketAddr = findent_rpc_addr_str.parse().unwrap(); 
-    println!("EntityFinderServer listening on: {findent_rpc_addr}");
+    let extrent_rpc_addr_str: String = env::var("EXTRENT_RPC_ADDR").unwrap_or("[::1]:10000".to_string());
+    let extrent_rpc_addr : std::net::SocketAddr = extrent_rpc_addr_str.parse().unwrap(); 
+    println!("EntityExtractorServer listening on: {extrent_rpc_addr}");
 
-    let entity_finder = EntityFinderService { rusty_nlp_model : Arc::new(nlp) };
+    let entity_extractor = EntityExtractorService { rusty_nlp_model : Arc::new(nlp) };
 
-    let svc = EntityFinderServer::new(entity_finder);
+    let svc = EntityExtractorServer::new(entity_extractor);
 
-    Server::builder().add_service(svc).serve(findent_rpc_addr).await?;
+    Server::builder().add_service(svc).serve(extrent_rpc_addr).await?;
 
     Ok(())
 }

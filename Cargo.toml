@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "findent-server"
-path = "src/findent/server.rs"
+name = "extrent-server"
+path = "src/extrent/server.rs"
 
 [[bin]]
-name = "findent-client"
-path = "src/findent/client.rs"
+name = "extrent-client"
+path = "src/extrent/client.rs"
 
 [dependencies]
 tokio = { version="1.53.1", features = ["full"] }

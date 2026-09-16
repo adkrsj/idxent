@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package findent;
+package extrent;
 
-message FindEntityRequest
+message ExtractEntityRequest
 {
     string text = 1;                  // text to find Named Entities in it
     repeated string entity_types = 2; // list of entity types to return, e.g. "PERSON", "ORG"
@@ -16,14 +16,14 @@ message NamedEntityRef
     optional string sentence = 3; // text of the sentence in which the entity is mentioned
 }
 
-// describes named entities, extracted from a single web-page
-message FindEntityResponse
+// Describes named entities, extracted from a given text.
+message ExtractEntityResponse
 {
     repeated NamedEntityRef entity_refs = 1;
 }
 
 // The service to extract Named Entites from text.
-service EntityFinder
+service EntityExtractor
 {
-    rpc FindEntity(FindEntityRequest) returns (FindEntityResponse) {}
+    rpc ExtractEntity(ExtractEntityRequest) returns (ExtractEntityResponse) {}
 }
