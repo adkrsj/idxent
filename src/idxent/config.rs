@@ -1,18 +1,20 @@
 use serde::{Serialize,Deserialize};
 use std::collections::BTreeSet;
 use std::fs;
+use url::Url;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config
 {
-    pub sites : BTreeSet<String>, // set of sites (base URLs thereof) to index
+    pub sites : BTreeSet<Url>, // set of sites (base URLs thereof) to index
+    pub max_link_depth: u32,      // maximal depth of html links to explore  
 }
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 
 impl Config
 {
-    pub fn load()->Option<Config> // the caller is assumed to acquire the RwLock guard beforehand
+    pub fn load()->Option<Config>
     {
         let config_file_exists = fs::exists(CONFIG_FILE_NAME).unwrap_or(false);
         if !config_file_exists
@@ -30,11 +32,11 @@ impl Config
             Ok(file_config) => file_config,
             Err(err) => { println!("Failed deserializing config from '{CONFIG_FILE_NAME}': {err}"); return None}
         };
-        println!("Loaded config from '{CONFIG_FILE_NAME}':\n{:?}", file_config);
+        println!("Loaded config from '{CONFIG_FILE_NAME}':\n{config_content}");
         return Some(file_config)
     }
 
-    pub fn save(&self) // the caller is assumed to acquire the RwLock guard beforehand
+    pub fn save(&self)
     {
         let config_content_string = match toml::to_string(self)
         {
