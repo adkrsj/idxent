@@ -1,9 +1,9 @@
 use std::env;
 use std::fs;
-use std::error::Error;
 use std::option::Option;
 use std::collections::{BTreeSet,BTreeMap};
 use std::sync::{Arc};
+
 use tokio::{sync::{RwLock,Mutex,MutexGuard,mpsc}, task::{spawn,JoinHandle}};
 use axum::{Router, routing::{get, put}, extract::{State,Path}, Json, http::StatusCode};
 use url::{Url,Position,ParseError};
@@ -120,7 +120,7 @@ async fn site_put(
 ) -> Result<Json<String>, (StatusCode, String)>
 {
     println!("site_put: site_url={}", site_url);
-    let url_validate_result : Result<Url, Box<dyn Error>> = validate_site_url(site_url.as_str());
+    let url_validate_result : anyhow::Result<Url> = validate_site_url(site_url.as_str());
     let url: Url = match url_validate_result
     { 
         Ok(url) => url,
@@ -472,23 +472,23 @@ fn get_doc_base_url(doc: &Document, doc_url: &Url) -> Option<Url>
     base_tag_href.map_or_else(|| Url::parse(&doc_url[..Position::AfterPath]), Url::parse).ok()
 }
 
-fn validate_site_url(site_url : &str) -> Result<Url, Box<dyn Error>>
+fn validate_site_url(site_url : &str) -> anyhow::Result<Url>
 {
-    let url_parse_result = Url::parse(site_url);
+    let url_parse_result : Result<Url, ParseError> = Url::parse(site_url);
     if url_parse_result.is_err() 
     { 
-        Err(Box::new(url_parse_result.unwrap_err()))
+        Err(anyhow::Error::new(url_parse_result.unwrap_err()))
     } 
     else
     {
         let url : Url = url_parse_result.unwrap();
         if !url_is_http(&url)
         {
-            return Err(Box::<dyn Error>::from(format!("not a http(s) url: '{url}'")));
+            return Err(anyhow::Error::msg("not a http(s) url: '{url}'"));
         }
         else if url.cannot_be_a_base()
         {
-            return Err(Box::<dyn Error>::from(format!("URL '{url}' cannot be a base")));
+            return Err(anyhow::Error::msg(format!("URL '{url}' cannot be a base")));
         }
         Ok(url_before_query(&url))
     }
@@ -506,7 +506,7 @@ fn validate_site_url(site_url : &str) -> Result<Url, Box<dyn Error>>
 // all page urls, which have the host "www.example.com" and of which path starts with "/topics/cheercat/":
 // http://www.example.com/topics/cheercat/smile.html      - belongs to the site
 // http://www.example.com/topics/dog/index.html           - doesn't belong to the site
-pub fn get_site_url_path(url_site_start_page: &Url) -> Result<Url, Box<dyn Error>>
+pub fn get_site_url_path(url_site_start_page: &Url) -> anyhow::Result<Url>
 {
     let url_start_page_validated : Url = validate_site_url(url_site_start_page.as_str())?;
     let start_page_path : &str = url_start_page_validated.path();
@@ -522,7 +522,7 @@ pub fn get_site_url_path(url_site_start_page: &Url) -> Result<Url, Box<dyn Error
         match join_result
         {
             Ok(url) => Ok(url),
-            Err(parse_error) => Err(Box::new(parse_error))
+            Err(parse_error) => Err(anyhow::Error::new(parse_error))
         }
     }
 }

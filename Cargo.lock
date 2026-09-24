@@ -766,6 +766,7 @@ dependencies = [
 name = "idxent"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "grpc-protobuf-build",
  "html2text",

@@ -28,6 +28,7 @@ select = "0.6.1"
 serde = "1.0.229"
 toml = "1.1.6"
 rusty = "0.6.0"
+anyhow = "1.0.104"
 
 
 [build-dependencies]

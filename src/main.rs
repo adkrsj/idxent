@@ -10,16 +10,16 @@ use url::Url;
 use idxent::server::get_site_url_path;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>>
+async fn main() -> anyhow::Result<()>
 {
     // test work of get_site_url_path
     let url_site_start_page_str : String = env::var("URL").unwrap_or(String::from(""));
     if url_site_start_page_str.len() != 0
     {
         let url_site_start_page : Url = Url::parse(url_site_start_page_str.as_str())?;
-        println!("url_site_start_page:\t{url_site_start_page}");
+        println!("url_site_start_page: {url_site_start_page}");
         let get_site_url_path : Url = get_site_url_path(&url_site_start_page)?;
-        println!("get_site_url_path:\t\t{get_site_url_path}");
+        println!("get_site_url_path:   {get_site_url_path}");
         return Ok(());
     }
 
