@@ -1,11 +1,12 @@
 use std::env;
 use std::fs;
+use std::error::Error;
 use std::option::Option;
 use std::collections::{BTreeSet,BTreeMap};
 use std::sync::{Arc};
-use tokio::{time::{Duration}, sync::{RwLock,Mutex,MutexGuard,mpsc}, task::{spawn,JoinHandle}};
+use tokio::{sync::{RwLock,Mutex,MutexGuard,mpsc}, task::{spawn,JoinHandle}};
 use axum::{Router, routing::{get, put}, extract::{State,Path}, Json, http::StatusCode};
-use url::{Url,Position};
+use url::{Url,Position,ParseError};
 use select::document::Document;
 use select::predicate::Name;
 
@@ -119,7 +120,7 @@ async fn site_put(
 ) -> Result<Json<String>, (StatusCode, String)>
 {
     println!("site_put: site_url={}", site_url);
-    let url_validate_result : Result<Url, String> = validate_site_url(site_url.as_str());
+    let url_validate_result : Result<Url, Box<dyn Error>> = validate_site_url(site_url.as_str());
     let url: Url = match url_validate_result
     { 
         Ok(url) => url,
@@ -236,7 +237,7 @@ async fn index_task(shared_state: SharedState)
     // taking Read Lock to lock from changes the configuration - primarily the list of sites to index
     let sites : &BTreeSet<Url> = &shared_state.config.read().await.sites;
 
-    const CHANNEL_SIZE_DEFAULT: usize = 1000;
+    const CHANNEL_SIZE_DEFAULT: usize = 100;
     let channel_size: usize = env::var("IDX_CHANNEL_SIZE")
         .unwrap_or_default().as_str()
         .parse::<usize>().unwrap_or(CHANNEL_SIZE_DEFAULT);
@@ -246,32 +247,37 @@ async fn index_task(shared_state: SharedState)
     // the switch from parent to child pages happens via tokio tasks sending messages through mpsc channel
     let (tx, mut rx) = mpsc::channel(channel_size);
 
-    let mut valid_site_urls:Vec<Url> = Vec::<Url>::new();
-    for site_url in sites
+    // validate site's start page url and calculate site path url to filter contained site's pages among all links
+    let mut sites_urls:Vec<(Url,Url)> = Vec::<(Url,Url)>::new();
+    for url in sites
     {
-        let url_validate_result = validate_site_url(site_url.as_str());
-        match url_validate_result
+        let site_start_page_url = match validate_site_url(url.as_str())
         {
-            Ok(site_url) => valid_site_urls.push(site_url),
-            Err(err) => println!("{site_url} : unacceptable site url: {err}, skipped")
+            Ok(_url) => Some(_url),
+            Err(err) => {println!("{url} : skipped unacceptable site start page url: {err}"); None }
+        };
+        if site_start_page_url.is_some()
+        {
+            let site_url : Option<Url> = get_site_url_path(&site_start_page_url.as_ref().unwrap()).ok();
+            sites_urls.push( (site_url.unwrap(), site_start_page_url.unwrap()) );
         };
     }
 
-    for site_url in valid_site_urls
+    for (site_url, site_start_url) in sites_urls
     {
         println!("{site_url} start indexing site: ");
         let tx = tx.clone();
         let shared_state = shared_state.clone();
-        let page_url = site_url.clone();
+        let page_url = site_start_url.clone();
         tokio::task::spawn( async move {
             let send_result = tx.send(IdxPageMsg {
                 tx: Arc::<IdxPageSender>::new(tx.clone()),
                 shared_state : shared_state, 
                 site_url : site_url.clone(), 
                 page_url: page_url, 
-                link_depth : 0} 
+                link_depth : 0 } 
             ).await;
-            println!("{}: <- spawn site; tx.send result: {:?}", site_url.clone(), send_result);
+            println!("{}, start page {}: <- spawn site; tx.send result: {:?}", site_url.clone(), site_start_url.clone(), send_result);
         });
     }
 
@@ -466,23 +472,59 @@ fn get_doc_base_url(doc: &Document, doc_url: &Url) -> Option<Url>
     base_tag_href.map_or_else(|| Url::parse(&doc_url[..Position::AfterPath]), Url::parse).ok()
 }
 
-fn validate_site_url(site_url : &str) -> Result<Url, String>
+fn validate_site_url(site_url : &str) -> Result<Url, Box<dyn Error>>
 {
     let url_parse_result = Url::parse(site_url);
     if url_parse_result.is_err() 
     { 
-        return url_parse_result.map_err(|parse_err|parse_err.to_string())
-    };
-    let url : Url = url_parse_result.unwrap();
-    if !url_is_http(&url)
+        Err(Box::new(url_parse_result.unwrap_err()))
+    } 
+    else
     {
-        return Err(format!("not a http(s) url"));
+        let url : Url = url_parse_result.unwrap();
+        if !url_is_http(&url)
+        {
+            return Err(Box::<dyn Error>::from(format!("not a http(s) url: '{url}'")));
+        }
+        else if url.cannot_be_a_base()
+        {
+            return Err(Box::<dyn Error>::from(format!("URL '{url}' cannot be a base")));
+        }
+        Ok(url_before_query(&url))
     }
-    else if url.cannot_be_a_base()
+}
+
+// Converts the given site url (which might be url of site's start page)
+// into the url with directory-type path (ending with '/'),
+// which would be used to check if given page url belongs or not to site via
+// simply checking that the page url's path starts with the site url path.
+// Example:
+// url_site_start_page: http://www.example.com/topics/cheercat/index.html
+// produces 
+// site_url_path:       http://www.example.com/topics/cheercat/
+// with which we consider belonging to site with start page url_site_start_page
+// all page urls, which have the host "www.example.com" and of which path starts with "/topics/cheercat/":
+// http://www.example.com/topics/cheercat/smile.html      - belongs to the site
+// http://www.example.com/topics/dog/index.html           - doesn't belong to the site
+pub fn get_site_url_path(url_site_start_page: &Url) -> Result<Url, Box<dyn Error>>
+{
+    let url_start_page_validated : Url = validate_site_url(url_site_start_page.as_str())?;
+    let start_page_path : &str = url_start_page_validated.path();
+    if start_page_path.ends_with('/')
     {
-        return Err(format!("URL '{url}' cannot be a base"));
+        Ok(url_start_page_validated)
     }
-    Ok(url_before_query(&url))
+    else
+    {
+        // path ends with a file, like in /topics/cheercat/smile.html
+        // switch from file path do directory path
+        let join_result : Result<Url, ParseError> = url_start_page_validated.join(".");
+        match join_result
+        {
+            Ok(url) => Ok(url),
+            Err(parse_error) => Err(Box::new(parse_error))
+        }
+    }
 }
 
 fn url_is_http(url: &Url) -> bool
