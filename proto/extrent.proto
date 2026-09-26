@@ -5,14 +5,14 @@ package extrent;
 message ExtractEntityRequest
 {
     string text = 1;                  // text to find Named Entities in it
-    repeated string entity_types = 2; // list of entity types to return, e.g. "PERSON", "ORG"
+    repeated string entity_kinds = 2; // list of entity kinds to return, e.g. "PERSON", "ORG"
     bool return_sentence = 3;         // wether to return the containing sentence in NamedEntityRef
 }
 
 message NamedEntityRef
 {
-    string entity_type = 1;       // e.g.  "PERSON", "ORG"
-    string entity_value = 2;      // actual name, e.g. "John Smith"
+    string kind = 1;              // e.g. "PERSON", "ORG"
+    string value = 2;             // actual name, e.g. "John Smith"
     optional string sentence = 3; // text of the sentence in which the entity is mentioned
 }
 

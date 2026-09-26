@@ -27,14 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //  println!("TEXT FROM SOURCE_FILE={}:\n{}", source_file, text);
     }
 
-    let mut entity_types : Vec<String> = vec![];
-    let entity_types_var = env::var("ENTITY_TYPES");
-    if entity_types_var.is_ok()
+    let mut entity_kinds : Vec<String> = vec![];
+    let entity_kinds_var = env::var("ENTITY_KINDS");
+    if entity_kinds_var.is_ok()
     {
-        let entity_types_str : String = entity_types_var.unwrap();
-        entity_types = entity_types_str.split(",").map(String::from).collect();
+        let entity_kinds_str : String = entity_kinds_var.unwrap();
+        entity_kinds = entity_kinds_str.split(",").map(String::from).collect();
     }
-    println!("entity_types: {}", entity_types.join(":"));
+    println!("entity_kinds: {}", entity_kinds.join(":"));
 
     let extrent_rpc_addr_str: String = env::var("EXTRENT_RPC_ADDR").unwrap_or("[::1]:10000".to_string());
     let extrent_rpc_connect_str = format!("http://{}", extrent_rpc_addr_str);
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = client
         .extract_entity(Request::new(ExtractEntityRequest {
             text: text,
-            entity_types: entity_types,
+            entity_kinds: entity_kinds,
             return_sentence: return_sentence,
         }))
         .await?;

@@ -43,7 +43,7 @@ impl EntityExtractor for EntityExtractorService
         println!("extract_entity = {:?}", request);
 
         let text : &str = request.get_ref().text.as_str();
-        let ent_types : &Vec<String> = &request.get_ref().entity_types;
+        let ent_kinds : &Vec<String> = &request.get_ref().entity_kinds;
         let return_sentence : bool = request.get_ref().return_sentence;
         let rusty_doc: rusty::Doc = handle_rusty_result_error!(self.rusty_nlp_model.nlp(text));
         let rusty_ents: Vec<rusty::Span> = handle_rusty_result_error!(rusty_doc.ents());
@@ -51,12 +51,12 @@ impl EntityExtractor for EntityExtractorService
         // select named entities of types listed in request
         let entity_refs: Vec<NamedEntityRef> = rusty_ents.iter()
             .filter(|rusty_ent|
-                    ent_types.is_empty() || 
-                    ent_types.iter().any(|ent_type|*ent_type == rusty_ent.label_().unwrap_or_default()))
+                    ent_kinds.is_empty() || 
+                    ent_kinds.iter().any(|ent_kind|*ent_kind == rusty_ent.label_().unwrap_or_default()))
             .map(|rusty_ent|
                 NamedEntityRef {
-                    entity_type : rusty_ent.label_().unwrap_or_default(),
-                    entity_value : rusty_ent.text().unwrap_or_default(),
+                    kind : rusty_ent.label_().unwrap_or_default(),
+                    value : rusty_ent.text().unwrap_or_default(),
                     sentence : if return_sentence && rusty_ent.sent().is_ok() 
                         { Some( rusty_ent.sent().unwrap().text().unwrap_or_default() ) } 
                         else { None },
