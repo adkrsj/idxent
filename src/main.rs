@@ -1,11 +1,13 @@
-mod idxent;
-use idxent::server::Server;
-
-use std::error::Error;
 use std::env;
 use std::sync::Arc;
 
-// for test
+use anyhow::Context;
+use sqlx::postgres::{PgPoolOptions,PgPool};
+
+mod idxent;
+use idxent::server::Server;
+
+// for test of get_site_url_path
 use url::Url;
 use idxent::server::get_site_url_path;
 
@@ -23,7 +25,16 @@ async fn main() -> anyhow::Result<()>
         return Ok(());
     }
 
-    let idxent_server = Arc::new(Server::new());
+    let database_url = env::var("DATABASE_URL").context("Env. var. DATABASE_URL is not set")?;
+    let db_pool : PgPool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&database_url)
+        .await
+        .context(format!("failed connect to {database_url}"))?;
+
+    sqlx::migrate!("./migrations").run(&db_pool).await?;
+
+    let idxent_server = Arc::new(Server::new(&db_pool));
 
     // run idxent server with hyper, listening locally on port 8080
     let idxent_bind_addr = env::var("IDXENT_BIND_ADDR").unwrap_or(String::from("127.0.0.1:8080"));

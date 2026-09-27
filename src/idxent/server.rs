@@ -1,27 +1,31 @@
 use std::env;
-use std::fs;
 use std::option::Option;
+use std::error::Error;
 use std::collections::{BTreeSet,BTreeMap};
 use std::sync::{Arc};
 
-use tokio::{sync::{RwLock,Mutex,MutexGuard,mpsc}, task::{spawn,JoinHandle}};
+use tokio::{sync::{RwLock,Mutex,MutexGuard,mpsc}, task::JoinHandle};
 use axum::{Router, routing::{get, put}, extract::{State,Path}, Json, http::StatusCode};
 use url::{Url,Position,ParseError};
 use select::document::Document;
 use select::predicate::Name;
 
+use sqlx::postgres::PgPool;
+
 use super::config::Config;
+use super::types::{SiteStatus, Site, Page, Entity};
+use super::storage as storage;
 
 use reqwest;
 use html2text;
-//use rusty::*;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone/*, Default*/)]
 pub struct SharedState
 {
     config : Arc<RwLock<Config>>, //configuration, guarded by RwLock from simultaneous read and write
+    db_pool : Arc<sqlx::PgPool>, // pool of connectionы to postgresql db
     idx_task: Arc<Mutex<Option<JoinHandle<()>>>>, // handle of the spawned indexing task
-    idx_pages: Arc<RwLock<BTreeMap<Url, IdxPageStatus>>>  // maps URLs of page being indexed into current status, to excluded concurrent/repeated processing
+    idx_pages: Arc<RwLock<BTreeMap<Url, IdxPageStatus>>> // maps URLs of page being indexed into current status, to exclude concurrent/repeated processing
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,10 +46,11 @@ pub struct Server
 
 impl Server
 {
-    pub fn new() -> Self
+    pub fn new(db_pool : &PgPool) -> Self
     {
         let shared_state = SharedState {
             config : Arc::new(RwLock::new( Config::load().unwrap_or_default() )), 
+            db_pool : Arc::new(db_pool.clone()),
             idx_task : Arc::new(Mutex::new(None)),
             idx_pages : Arc::new(RwLock::new(BTreeMap::<Url, IdxPageStatus>::new()))
         };
@@ -55,7 +60,7 @@ impl Server
         // paths, defining and controlling the list of sites to index
         .route("/index/sites", get(sites_list).delete(sites_clear))
         .route("/index/sites/{*site_url}", put(site_put).delete(site_delete))
-            // start/stop indexing task
+        // start/stop indexing task
         .route("/index/start", get(index_start))
         .route("/index/stop", get(index_stop))
         .with_state(shared_state.clone());
@@ -231,21 +236,18 @@ async fn index_stop(
     }
 }
 
+// performs indexing of all sites, listed in configuration
 async fn index_task(shared_state: SharedState)
 {
     println!("index_task: start");
-    // taking Read Lock to lock from changes the configuration - primarily the list of sites to index
+    // taking Read Lock to lock from changes the configuration - specifically, the list of sites to index
     let sites : &BTreeSet<Url> = &shared_state.config.read().await.sites;
 
-    const CHANNEL_SIZE_DEFAULT: usize = 100;
-    let channel_size: usize = env::var("IDX_CHANNEL_SIZE")
-        .unwrap_or_default().as_str()
-        .parse::<usize>().unwrap_or(CHANNEL_SIZE_DEFAULT);
-    println!("index_task: channel_size={channel_size}");
-
-    // upon loading a web page, the indexer extracts it's link and explores linked pages;
-    // the switch from parent to child pages happens via tokio tasks sending messages through mpsc channel
-    let (tx, mut rx) = mpsc::channel(channel_size);
+    {
+        let mut idx_pages_lock = shared_state.idx_pages.write().await;
+        let idx_pages : &mut BTreeMap<Url, IdxPageStatus> = &mut *idx_pages_lock;
+        idx_pages.clear();
+    }
 
     // validate site's start page url and calculate site path url to filter contained site's pages among all links
     let mut sites_urls:Vec<(Url,Url)> = Vec::<(Url,Url)>::new();
@@ -263,33 +265,24 @@ async fn index_task(shared_state: SharedState)
         };
     }
 
+    let mut index_site_tasks = Vec::<JoinHandle<()>>::new();
     for (site_url, site_start_url) in sites_urls
     {
-        println!("{site_url} start indexing site: ");
-        let tx = tx.clone();
-        let shared_state = shared_state.clone();
-        let page_url = site_start_url.clone();
-        tokio::task::spawn( async move {
-            let send_result = tx.send(IdxPageMsg {
-                tx: Arc::<IdxPageSender>::new(tx.clone()),
-                shared_state : shared_state, 
-                site_url : site_url.clone(), 
-                page_url: page_url, 
-                link_depth : 0 } 
-            ).await;
-            println!("{}, start page {}: <- spawn site; tx.send result: {:?}", site_url.clone(), site_start_url.clone(), send_result);
-        });
+        let shared_state_clone = shared_state.clone();
+        // spawns the task of site indexing
+        index_site_tasks.push(
+            tokio::task::spawn(async move { 
+                index_site(shared_state_clone, site_url.clone(), site_start_url.clone()).await }
+            ));
     }
 
-    // The `rx` half of the channel returns `None` once **all** `tx` clones drop.
-    // Drop the handle owned by the current task to ensure rx.recv() returns `None`.
-    drop(tx);
-    while let Some(idx_page_msg) = rx.recv().await
+    // for for sites' indexing to finish
+    for index_site_task in index_site_tasks
     {
-        println!("{0} <- rx.recv, rx.len={1}", idx_page_msg.page_url, rx.len());
-        tokio::task::spawn(async move {index_page(&idx_page_msg).await });
-    };
-    println!("index_task: mpsc channel is empty, stopping ...");
+        let _ = index_site_task.await; 
+    }
+
+    println!("index_task: stopping ...");
 
     // drop the handle of indexing task (which we store in order to implement abort function)
     let mut lock_guard: MutexGuard<'_,Option<JoinHandle<()>>> = shared_state.idx_task.lock().await;
@@ -304,6 +297,74 @@ async fn index_task(shared_state: SharedState)
     }
 }
 
+// performs indexing of pages of a single site
+async fn index_site
+(
+    shared_state : SharedState,
+    site_url : Url,
+    site_start_url : Url
+)
+{
+    const CHANNEL_SIZE_DEFAULT: usize = 16;
+    let channel_size: usize = env::var("IDX_CHANNEL_SIZE")
+        .unwrap_or_default().as_str()
+        .parse::<usize>().unwrap_or(CHANNEL_SIZE_DEFAULT);
+    println!("{site_url} index_site start: mpsc channel_size={channel_size}");
+
+    let db_pool : &PgPool = &shared_state.db_pool;
+    let site_delete_result = storage::delete_site(db_pool, site_url.as_str()).await;
+    match site_delete_result
+    {
+        Ok(affected_rows) => println!("{site_url} deleted site in db, {affected_rows} affected rows"),
+        Err(err) => println!("{site_url} failed to delete site in db, {err}")
+    };
+
+    let site_create_result : sqlx::Result<Site> = storage::create_site(db_pool, site_url.as_str()).await;
+    let site : Site = match site_create_result
+    {
+        Ok(_site) => { println!("{site_url} created site in db with id {}", _site.id); _site },
+        Err(err) => { println!("{site_url} failed to create site in db: {:?}", err); return }
+    };
+
+    // upon loading a web page, the site index task extracts it's link and explores linked pages;
+    // the switch from parent to child pages happens via tokio tasks sending messages through mpsc channel;
+    // the channel is created per-site; when the channel contains no more messages, the site indexing is finished
+    // (if the same channel was used for all sites, then it would be difficult to say when a particular site indexing finished).
+    let (tx, mut rx) = mpsc::channel(channel_size);
+
+    let _shared_state = shared_state.clone();
+    let _site_url = site_url.clone();
+    let _page_url = site_start_url.clone();
+    let arc_tx = Arc::<IdxPageSender>::new(tx.clone()); 
+
+    tokio::task::spawn( async move {
+        let _send_result = arc_tx.send(IdxPageMsg {
+            tx: arc_tx.clone(),
+            shared_state : _shared_state.clone(), 
+            site_url : _site_url.clone(), 
+            site_id : site.id,
+            page_url : _page_url.clone(), 
+            link_depth : 0 } 
+        ).await;
+    });
+
+    // The `rx` half of the channel returns `None` once **all** `tx` clones drop.
+    // Drop the handle owned by the current task to ensure rx.recv() returns `None`.
+    drop(tx);
+    while let Some(idx_page_msg) = rx.recv().await
+    {
+        println!("{0} <- rx.recv, rx.len={1}", idx_page_msg.page_url, rx.len());
+        tokio::task::spawn(async move {index_page(&idx_page_msg).await });
+    };
+    println!("{site_url} index_site: mpsc channel is empty, indexing is complete");
+
+    let get_site_result : sqlx::Result<Site> = storage::get_site(db_pool, site_url.as_str()).await;
+    if let Ok(site) = get_site_result
+    {
+        let _ = storage::update_site_status(db_pool, site.id, SiteStatus::Indexed, "").await;
+    };
+}
+
 #[derive(Debug, Clone)]
 struct IdxPageMsg
 {
@@ -312,18 +373,20 @@ struct IdxPageMsg
     tx : Arc<IdxPageSender>, 
     shared_state : SharedState, // synchronized configuration and per-page state of processing
     site_url : Url, // context site, used to limit the links to those only within site
+    site_id : i32,  // site id in db
     page_url : Url, // url of page to process
     link_depth: u32 // link distance from the site initial page to the page being processed
 }
 
 type IdxPageSender = tokio::sync::mpsc::Sender<IdxPageMsg>;
 
-async fn index_page(
-    idx_page_msg : &IdxPageMsg)
+async fn index_page(idx_page_msg : &IdxPageMsg)
 {
     let tx: &Arc<IdxPageSender>  = &idx_page_msg.tx;
     let shared_state: &SharedState = &idx_page_msg.shared_state;
+    let db_pool : &PgPool = &shared_state.db_pool;
     let site_url: &Url = &idx_page_msg.site_url;
+    let site_id: i32 = idx_page_msg.site_id;
     let page_url: &Url = &idx_page_msg.page_url;
     let page_depth: u32 = idx_page_msg.link_depth;
 
@@ -336,25 +399,31 @@ async fn index_page(
     // mark this page as being processed
     let mut opt_err : Option<String> = None;
     let mut page_status = IdxPageStatus::New;
-    update_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+    report_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
 
-    let page_load_result : Result<String, reqwest::Error> = load_page(page_url).await;
-    let mut opt_html : Option<String> = None;
-    match page_load_result
+    let page_load_result : Result<String, reqwest::Error> = load_page(page_url_no_fragment).await;
+    let opt_html : Option<String> = match page_load_result
     {
-        Ok(html)   => { page_status = IdxPageStatus::Loaded; opt_html = Some(html); },
-        Err(error) => { page_status = IdxPageStatus::Error; opt_err = Some(error.to_string()); }
+        Ok(ref html)   => { page_status = IdxPageStatus::Loaded; Some(html.to_string()) },
+        Err(ref error) => { page_status = IdxPageStatus::Error; opt_err = Some(error.to_string()); None }
     };
-    update_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+    report_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+
     if page_status == IdxPageStatus::Error
     {
+        let msg : String = format!("{page_url}: load page failed: {}", page_load_result.unwrap_err());
+        let _ = storage::update_site_status(db_pool, site_id, SiteStatus::Failed, msg.as_str()).await;
         return
     }
+
+    let _create_page_result : sqlx::Result<Page> =
+        storage::create_page(db_pool, page_url_no_fragment.as_str(), site_id).await;
+
 
     // TODO: extract entities, store into db, handle errors if any
 
     page_status = IdxPageStatus::ProcessedBody;
-    update_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+    report_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
 
     // setup processing linked pages
 
@@ -395,6 +464,7 @@ async fn index_page(
                         tx : tx.clone(),
                         shared_state : shared_state.clone(), 
                         site_url : site_url.clone(), 
+                        site_id : idx_page_msg.site_id,
                         page_url : link_url.clone(), 
                         link_depth : page_depth+1 
                     };
@@ -403,10 +473,10 @@ async fn index_page(
         }
     };
 
-    update_page_status(shared_state, page_url_no_fragment, &IdxPageStatus::ProcessedLinks, &opt_err).await;
+    report_page_status(shared_state, page_url_no_fragment, &IdxPageStatus::ProcessedLinks, &opt_err).await;
 }
 
-async fn update_page_status(
+async fn report_page_status(
     shared_state : &SharedState, 
     page_url_no_fragment : &Url, 
     status_new : &IdxPageStatus,
@@ -431,6 +501,7 @@ async fn update_page_status(
     };
     println!("{page_url_no_fragment} status {} -> {:?} {}", status_old_str, status_new, err_str);
 }
+
 
 // Fetches page HTML over HTTP
 // Fails early on non-2xx responses

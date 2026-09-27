@@ -1,6 +1,10 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+
+    // generate de-/serialization data, client and server -side code from protobuf description 
+    // using tonic and prost
+
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let output_dir = manifest_dir.join("src/extrent/generated");
     println!("output_dir: {}", output_dir.display());
@@ -12,6 +16,9 @@ fn main() {
         .compile_protos(&["proto/extrent.proto"], &["proto"])
         .unwrap();
 
+    /*
+    // old variant of generation using grpc
+
     println!("cargo:rerun-if-env-changed=proto/extrent.proto");
 
     println!("cargo:rerun-if-changed=extrent.proto");
@@ -22,5 +29,9 @@ fn main() {
         .client_only()
         .compile()
         .unwrap();
+    */
+
+    // sqlx data scheme: trigger recompilation when a new migration is added
+    println!("cargo:rerun-if-changed=migrations");
 }
 
