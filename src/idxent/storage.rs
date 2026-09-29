@@ -1,6 +1,7 @@
 use sqlx::{postgres::{PgPool,PgQueryResult}};
 use super::types::{SiteStatus, Site, Page, Entity};
 use chrono::prelude::*;
+use crate::extrent::NamedEntityRef;
 
 // The module provides access to db (PostgreSQL)
 
@@ -123,5 +124,38 @@ pub async fn create_entity(
         .fetch_one(pool)
         .await?;
     Ok(entity_created)
+}
+
+// bulk insert
+pub async fn create_entities(
+    pool : &PgPool, 
+    page_id : i32,
+    ent_refs : &Vec<NamedEntityRef>
+) -> sqlx::Result<Vec<Entity>>    
+{
+    let count : usize = ent_refs.len();
+    let mut page_ids : Vec<i32> = Vec::with_capacity(count);
+    let mut kinds : Vec<String> = Vec::with_capacity(count);
+    let mut values : Vec<String> = Vec::with_capacity(count);
+    let mut sentences : Vec<Option<String>> = Vec::with_capacity(count);
+    for ent_ref in ent_refs
+    {
+        page_ids.push(page_id);
+        kinds.push(ent_ref.kind.clone());
+        values.push(ent_ref.value.clone());
+        sentences.push(ent_ref.sentence.clone());
+    };
+    let entities_created : Vec<Entity> = sqlx::query_as(r#"
+        INSERT INTO entities (page_id, kind, value, sentence) 
+        SELECT * FROM UNNEST($1::integer[], $2::text[], $3::text[],$4::text[])
+        RETURNING id, page_id, kind, value, sentence
+        "#)
+        .bind(page_ids)
+        .bind(kinds)
+        .bind(values)
+        .bind(sentences)
+        .fetch_all(pool)
+        .await?;
+    Ok(entities_created)
 }
 

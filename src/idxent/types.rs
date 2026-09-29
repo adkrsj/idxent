@@ -18,17 +18,17 @@ pub struct Site
 #[derive(Debug, sqlx::Type, sqlx::FromRow)]
 pub struct Page
 {
-    id : i32,
-    url : String,
-    site_id : i32
+    pub id : i32,
+    pub url : String,
+    pub site_id : i32
 }
 
 #[derive(Debug, sqlx::Type, sqlx::FromRow)]
 pub struct Entity
 {
-    id : i32,
-    page_id : i32,
-    kind : String,
-    value : String,
-    sentence : String
+    pub id : i32,
+    pub page_id : i32,
+    pub kind : String,
+    pub value : String,
+    pub sentence : String
 }

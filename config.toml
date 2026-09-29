@@ -1,0 +1,13 @@
+sites = [
+    "https://www.un.org/en/about-us/member-states"
+]
+
+# link depth: 0 - only process specified start page; 
+# positive n - process linked pages up to n; 
+# negative - process linked pages recursively as long as they point to the same site (<host>/path/on/site/)
+max_link_depth = -1
+
+extrent_rcp_addr = "127.0.0.1:8090"
+extrent_entity_kinds=["PERSON","ORG","NORP","GPE","LOC","FAC"]
+# extrent_entity_kinds=["PERSON","ORG","NORP","GPE","LOC","FAC","PRODUCT","EVENT","LANGUAGE"]
+extrent_return_sentence=true

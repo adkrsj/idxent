@@ -7,9 +7,10 @@ use url::Url;
 pub struct Config
 {
     pub sites : BTreeSet<Url>, // set of sites (base URLs thereof) to index
-    pub max_link_depth: u32,   // maximal depth of html links to explore
+    pub max_link_depth: i32,   // maximal depth of html links to explore
     pub extrent_rcp_addr : String, // IP:port of extract entity service
-    pub entity_kinds : Vec<String> // kinds of entities to extract, e.g. ["PERSON", "ORG"]
+    pub extrent_entity_kinds : Vec<String>, // kinds of entities to extract, e.g. ["PERSON", "ORG"]
+    pub extrent_return_sentence : bool // whether to extract and store the containing sentence together with entities
 }
 
 const CONFIG_FILE_NAME: &str = "config.toml";

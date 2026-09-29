@@ -1,29 +1,36 @@
 use std::env;
 use std::option::Option;
-use std::error::Error;
 use std::collections::{BTreeSet,BTreeMap};
 use std::sync::{Arc};
 
+use anyhow::Context;
+
 use tokio::{sync::{RwLock,Mutex,MutexGuard,mpsc}, task::JoinHandle};
 use axum::{Router, routing::{get, put}, extract::{State,Path}, Json, http::StatusCode};
-use url::{Url,Position,ParseError};
-use select::document::Document;
-use select::predicate::Name;
+
+use url::Url;
+use reqwest;
+use deformat::extract;
 
 use sqlx::postgres::PgPool;
 
 use super::config::Config;
+use super::util::*;
 use super::types::{SiteStatus, Site, Page, Entity};
 use super::storage as storage;
 
-use reqwest;
-use html2text;
+// extract entity service includes
+use crate::extrent::{ExtractEntityRequest, NamedEntityRef, ExtractEntityResponse};
+use crate::extrent::entity_extractor_client::EntityExtractorClient;
+type EntityExtractorClientImpl = EntityExtractorClient<tonic::transport::Channel>;
 
-#[derive(Debug, Clone/*, Default*/)]
+
+#[derive(Debug, Clone)]
 pub struct SharedState
 {
     config : Arc<RwLock<Config>>, //configuration, guarded by RwLock from simultaneous read and write
     db_pool : Arc<sqlx::PgPool>, // pool of connectionы to postgresql db
+    extrent_client : Arc<RwLock<EntityExtractorClientImpl>>, // client connected to 'extract entity' server
     idx_task: Arc<Mutex<Option<JoinHandle<()>>>>, // handle of the spawned indexing task
     idx_pages: Arc<RwLock<BTreeMap<Url, IdxPageStatus>>> // maps URLs of page being indexed into current status, to exclude concurrent/repeated processing
 }
@@ -33,9 +40,10 @@ enum IdxPageStatus
 {
     New,
     Loaded,
-    ProcessedBody,
-    ProcessedLinks,
-    Error,
+    TextRead,
+    EntitiesExtracted,
+    EntitiesWritten,
+    LinksProcessed,
 }
 
 pub struct Server
@@ -46,11 +54,16 @@ pub struct Server
 
 impl Server
 {
-    pub fn new(db_pool : &PgPool) -> Self
+    pub fn new(
+        config : &Config, 
+        db_pool : &PgPool,
+        extrent_client : &EntityExtractorClientImpl
+    ) -> Self
     {
         let shared_state = SharedState {
-            config : Arc::new(RwLock::new( Config::load().unwrap_or_default() )), 
+            config : Arc::new(RwLock::new(config.clone())), 
             db_pool : Arc::new(db_pool.clone()),
+            extrent_client : Arc::new(RwLock::new(extrent_client.clone())),
             idx_task : Arc::new(Mutex::new(None)),
             idx_pages : Arc::new(RwLock::new(BTreeMap::<Url, IdxPageStatus>::new()))
         };
@@ -181,6 +194,8 @@ async fn site_delete(
     }
 }
 
+
+
 #[axum::debug_handler]
 async fn index_start(
     State(state): State<SharedState>
@@ -276,7 +291,7 @@ async fn index_task(shared_state: SharedState)
             ));
     }
 
-    // for for sites' indexing to finish
+    // wait for all sites' indexing to finish
     for index_site_task in index_site_tasks
     {
         let _ = index_site_task.await; 
@@ -359,7 +374,7 @@ async fn index_site
     println!("{site_url} index_site: mpsc channel is empty, indexing is complete");
 
     let get_site_result : sqlx::Result<Site> = storage::get_site(db_pool, site_url.as_str()).await;
-    if let Ok(site) = get_site_result
+    if let Ok(site) = get_site_result && site.status != SiteStatus::Failed
     {
         let _ = storage::update_site_status(db_pool, site.id, SiteStatus::Indexed, "").await;
     };
@@ -375,63 +390,95 @@ struct IdxPageMsg
     site_url : Url, // context site, used to limit the links to those only within site
     site_id : i32,  // site id in db
     page_url : Url, // url of page to process
-    link_depth: u32 // link distance from the site initial page to the page being processed
+    link_depth: i32 // link distance from the site initial page to the page being processed
 }
 
 type IdxPageSender = tokio::sync::mpsc::Sender<IdxPageMsg>;
 
 async fn index_page(idx_page_msg : &IdxPageMsg)
 {
+    let result : anyhow::Result<()> = index_page_inner(&idx_page_msg.clone()).await;
+    if let Err(err) = result
+    {
+        let _ = storage::update_site_status(
+            &idx_page_msg.shared_state.db_pool, 
+            idx_page_msg.site_id, 
+            SiteStatus::Failed, 
+            err.to_string().as_str()).await;
+    };
+}
+
+async fn index_page_inner(idx_page_msg : &IdxPageMsg) -> anyhow::Result<()>
+{
     let tx: &Arc<IdxPageSender>  = &idx_page_msg.tx;
     let shared_state: &SharedState = &idx_page_msg.shared_state;
     let db_pool : &PgPool = &shared_state.db_pool;
+    let config : &Config = &*shared_state.config.read().await;
     let site_url: &Url = &idx_page_msg.site_url;
     let site_id: i32 = idx_page_msg.site_id;
     let page_url: &Url = &idx_page_msg.page_url;
-    let page_depth: u32 = idx_page_msg.link_depth;
+    let page_depth: i32 = idx_page_msg.link_depth;
 
     let page_url_no_fragment: &Url = &url_no_fragment(page_url);
     if page_url_no_fragment != page_url
     {
         println!("{page_url} : url := {page_url_no_fragment}, removed URL fragments part");
     }
+    let _ = report_page_status::<&str, ()>(
+        shared_state, page_url_no_fragment, &IdxPageStatus::New, Ok("")).await;
 
-    // mark this page as being processed
-    let mut opt_err : Option<String> = None;
-    let mut page_status = IdxPageStatus::New;
-    report_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+    let page_load_result : anyhow::Result<String> = 
+        load_page(page_url_no_fragment).await
+        .context("load page");
 
-    let page_load_result : Result<String, reqwest::Error> = load_page(page_url_no_fragment).await;
-    let opt_html : Option<String> = match page_load_result
-    {
-        Ok(ref html)   => { page_status = IdxPageStatus::Loaded; Some(html.to_string()) },
-        Err(ref error) => { page_status = IdxPageStatus::Error; opt_err = Some(error.to_string()); None }
-    };
-    report_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+    let html : String = report_page_status(
+        shared_state, page_url_no_fragment, &IdxPageStatus::Loaded, page_load_result).await?;
 
-    if page_status == IdxPageStatus::Error
-    {
-        let msg : String = format!("{page_url}: load page failed: {}", page_load_result.unwrap_err());
-        let _ = storage::update_site_status(db_pool, site_id, SiteStatus::Failed, msg.as_str()).await;
-        return
-    }
+    let extract_text_result : anyhow::Result<deformat::Extracted> = 
+        extract_text(&html)
+        .context("extract text");
 
-    let _create_page_result : sqlx::Result<Page> =
-        storage::create_page(db_pool, page_url_no_fragment.as_str(), site_id).await;
+    let text : String = report_page_status(
+        shared_state, page_url_no_fragment, &IdxPageStatus::TextRead, extract_text_result).await?.text;
+    
+    let page: Page =
+        storage::create_page(db_pool, page_url_no_fragment.as_str(), site_id).await
+        .context("create page object in db")?;
 
+    let extract_entity_request = tonic::Request::new(
+        ExtractEntityRequest {
+            text : text,
+            entity_kinds : config.extrent_entity_kinds.clone(),
+            return_sentence : config.extrent_return_sentence,
+        });
 
-    // TODO: extract entities, store into db, handle errors if any
+    // extract from the text the named entities via dedicated remote service
+    let extract_entity_result : anyhow::Result<tonic::Response<ExtractEntityResponse>> =
+        shared_state.extrent_client.write().await
+        .extract_entity(extract_entity_request).await
+        .context("extract_entity rpc");
 
-    page_status = IdxPageStatus::ProcessedBody;
-    report_page_status(shared_state, page_url_no_fragment, &page_status, &opt_err).await;
+    let extract_entity_response : ExtractEntityResponse = 
+        report_page_status(shared_state, page_url_no_fragment, &IdxPageStatus::EntitiesExtracted, extract_entity_result)
+        .await?
+        .into_inner();
+
+    println!("{page_url_no_fragment} extracted {} named entities", extract_entity_response.entity_refs.len());
+
+    // write extracted entities into db via bulk insert
+    let create_entities_result : anyhow::Result<Vec<Entity>> = 
+        storage::create_entities(db_pool, page.id, &extract_entity_response.entity_refs)
+        .await
+        .context("create entities in db");
+
+    let _ = report_page_status(
+        shared_state, page_url_no_fragment, &IdxPageStatus::EntitiesWritten, create_entities_result)
+        .await?;
 
     // setup processing linked pages
 
     // all links, pointing within the same site
-    let page_links : &Vec<Url> = 
-        if opt_html.is_some() 
-        { &get_page_links(&opt_html.unwrap(), &page_url, &site_url) } 
-        else { &vec![] };
+    let page_links : &Vec<Url> = &get_page_links(&html, &page_url, &site_url);
     let page_link_count : usize = page_links.len();
 
     // unique links among them, after discarding optional fragment suffix "#section" of url
@@ -444,8 +491,8 @@ async fn index_page(idx_page_msg : &IdxPageMsg)
 
     // select unique link URLs, of which processing hasn't been started yet
     let mut page_links_unique_no_status : Vec<&Url> = vec![];
-    let max_link_depth : u32 = shared_state.config.read().await.max_link_depth;
-    if max_link_depth <=0 || page_depth < max_link_depth
+    let max_link_depth : i32 = config.max_link_depth;
+    if max_link_depth < 0 || page_depth < max_link_depth
     {
         let idx_pages_lock = shared_state.idx_pages.write().await;
 
@@ -473,33 +520,41 @@ async fn index_page(idx_page_msg : &IdxPageMsg)
         }
     };
 
-    report_page_status(shared_state, page_url_no_fragment, &IdxPageStatus::ProcessedLinks, &opt_err).await;
+    let _ = report_page_status::<&str, ()>(shared_state, page_url_no_fragment, &IdxPageStatus::LinksProcessed, Ok("")).await;
+
+    Ok(())
 }
 
-async fn report_page_status(
+async fn report_page_status<T, E>(
     shared_state : &SharedState, 
     page_url_no_fragment : &Url, 
     status_new : &IdxPageStatus,
-    opt_err : &Option<String>)
+    result : Result<T, E>
+) -> Result<T, E>
+where E : std::fmt::Debug
 {
     let mut idx_pages_lock = shared_state.idx_pages.write().await;
     let status_old : Option<IdxPageStatus> = (*idx_pages_lock).insert(page_url_no_fragment.clone(), status_new.clone());
+
     if *status_new == IdxPageStatus::New
     {
-        // assert that the page is NOT being/has been processed from another task 
+        // assert that the page is NOT being/has been processed from another task
         assert!(status_old.is_none());
     }
-    let err_str : &str  = match opt_err 
+
+    let err_str : String  = match result
     {
-        Some(err) => err.as_str(),
-        None => &""
+        Err(ref err) => format!(": error {err:?}") ,
+        Ok(ref value) => String::from("")
     };
+
     let status_old_str : String = match status_old
     {
         Some(status) => format!("{:?}", status),
         None => String::from("None")
     };
     println!("{page_url_no_fragment} status {} -> {:?} {}", status_old_str, status_new, err_str);
+    result
 }
 
 
@@ -518,165 +573,9 @@ async fn load_page(url: &Url) -> Result<String, reqwest::Error>
         .await
 }
 
-fn get_page_links(doc_html : &String, doc_url : &Url, site_url : &Url) -> Vec<Url>
+
+fn extract_text(html: &String) -> Result<deformat::Extracted, deformat::Error>
 {
-    let doc: Document = Document::from(doc_html.as_str());
-    let doc_base_url: Option<Url> = get_doc_base_url(&doc, doc_url);
-    // parse relative URLs as relative to supplied base URL
-    let url_base_parser = Url::options().base_url(doc_base_url.as_ref());
-    let links: Vec<Url> = 
-        doc.find(Name("a"))
-        .filter_map(|node|node.attr("href"))
-        .filter_map(|link|url_base_parser.parse(link).ok())
-        .filter(|url|url_is_http(url))
-         // only explore links within the same site (and initial path on it, if any)
-        .filter(|url|url.host_str() == site_url.host_str() && url.path().starts_with(site_url.path()))
-        .collect();
-    links
+    return deformat::extract(html);
 }
 
-// get doc's base url: take it from "base" element's href if defined,
-// otherwise use the doc's own url with path part
-fn get_doc_base_url(doc: &Document, doc_url: &Url) -> Option<Url>
-{
-    let base_tag_href = doc.find(Name("base")).filter_map(|n| n.attr("href")).nth(0);
-    base_tag_href.map_or_else(|| Url::parse(&doc_url[..Position::AfterPath]), Url::parse).ok()
-}
-
-fn validate_site_url(site_url : &str) -> anyhow::Result<Url>
-{
-    let url_parse_result : Result<Url, ParseError> = Url::parse(site_url);
-    if url_parse_result.is_err() 
-    { 
-        Err(anyhow::Error::new(url_parse_result.unwrap_err()))
-    } 
-    else
-    {
-        let url : Url = url_parse_result.unwrap();
-        if !url_is_http(&url)
-        {
-            return Err(anyhow::Error::msg("not a http(s) url: '{url}'"));
-        }
-        else if url.cannot_be_a_base()
-        {
-            return Err(anyhow::Error::msg(format!("URL '{url}' cannot be a base")));
-        }
-        Ok(url_before_query(&url))
-    }
-}
-
-// Converts the given site url (which might be url of site's start page)
-// into the url with directory-type path (ending with '/'),
-// which would be used to check if given page url belongs or not to site via
-// simply checking that the page url's path starts with the site url path.
-// Example:
-// url_site_start_page: http://www.example.com/topics/cheercat/index.html
-// produces 
-// site_url_path:       http://www.example.com/topics/cheercat/
-// with which we consider belonging to site with start page url_site_start_page
-// all page urls, which have the host "www.example.com" and of which path starts with "/topics/cheercat/":
-// http://www.example.com/topics/cheercat/smile.html      - belongs to the site
-// http://www.example.com/topics/dog/index.html           - doesn't belong to the site
-pub fn get_site_url_path(url_site_start_page: &Url) -> anyhow::Result<Url>
-{
-    let url_start_page_validated : Url = validate_site_url(url_site_start_page.as_str())?;
-    let start_page_path : &str = url_start_page_validated.path();
-    if start_page_path.ends_with('/')
-    {
-        Ok(url_start_page_validated)
-    }
-    else
-    {
-        // path ends with a file, like in /topics/cheercat/smile.html
-        // switch from file path do directory path
-        let join_result : Result<Url, ParseError> = url_start_page_validated.join(".");
-        match join_result
-        {
-            Ok(url) => Ok(url),
-            Err(parse_error) => Err(anyhow::Error::new(parse_error))
-        }
-    }
-}
-
-fn url_is_http(url: &Url) -> bool
-{
-    url.scheme() == "http" || url.scheme() == "https"
-}
-
-fn url_no_fragment(url: &Url) -> Url
-{
-    Url::parse(&url[..Position::AfterQuery]).unwrap_or(url.clone())
-}
-
-fn url_before_query(url: &Url) -> Url
-{
-    Url::parse(&url[..Position::BeforeQuery]).unwrap_or(url.clone())
-}
-
-
-fn html_to_text(html: &String) -> String
-{
-    html2text::from_read(html.as_bytes(), 1024).unwrap()
-}
-
-/*
-async fn test_load_page() -> Result<(), Box<dyn std::error::Error>>
-{
-    let mut text : String = "".to_string();
-
-    // read text from file
-    let source_file_var = env::var("SOURCE_FILE");
-    let source_url_var = env::var("SOURCE_URL");
-    if source_file_var.is_ok()
-    {
-        let source_file = source_file_var.unwrap();
-        println!("SOURCE_FILE: {}", source_file);
-        text = fs::read_to_string(&source_file).unwrap_or_else(
-            |error|{ panic!("Failed reading from file {}: {}", source_file, error) } );
-        println!("TEXT FROM SOURCE_FILE={}:\n{}", source_file, text);
-    }
-    else if source_url_var.is_ok()
-    {
-        let source_url = source_url_var.unwrap();
-        println!("SOURCE_URL: {}", source_url);
-        let html = load_page(&source_url).await?;
-        text = html_to_text(&html);
-        println!("TEXT FROM SOURCE_URL={}:\n{}", source_url, text);
-    }
-
-    if text.len() != 0
-    {
-        let _ = process_text_with_spacy(&text);
-    }
-    else
-    {
-        println!("No source for text is specified.");
-    }
-
-    Ok(())
-}
-*/
-
-/*
-fn process_text_with_spacy(text: &String) -> Result<(), SpaCyError>
-{
-    let spacy_model_name = env::var("SPACY_MODEL_NAME").unwrap_or("en_core_web_sm".to_string());
-
-    // using rusTy, rust wrapper of spaCy
-    let nlp = Language::load(spacy_model_name.as_str()).unwrap_or_else(
-        |error|{ panic!("Failed loading spaCy model {}: {}", spacy_model_name, error) } );
-
-        
-    let doc: rusty::Doc = nlp.nlp(text).unwrap_or_else(
-        |error|{ panic!("Failed processing text: {}", error) } );
-
-    let ents: Vec<rusty::Span> = doc.ents()?;
-    println!("ENTITIES:");
-    for ent in ents
-    {
-        println!("{}\t|\t{}\t|\t{}", ent.text()?, ent.label_()?, ent.sent()?.text()?);
-    }
-
-    Ok(())
-}
-*/

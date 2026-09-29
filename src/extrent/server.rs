@@ -4,15 +4,14 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+
+#[path="generated/extrent.rs"]
+mod extrent;
+
 use extrent::entity_extractor_server::{EntityExtractor, EntityExtractorServer};
 use extrent::{ExtractEntityRequest, NamedEntityRef, ExtractEntityResponse };
 
 use rusty::{Language};
-
-pub mod extrent
-{
-    include!("generated/extrent.rs");
-}
 
 
 #[derive(Debug)]
@@ -40,11 +39,13 @@ macro_rules! handle_rusty_result_error
 impl EntityExtractor for EntityExtractorService
 {
     async fn extract_entity(&self, request: Request<ExtractEntityRequest>) -> Result<Response<ExtractEntityResponse>, Status> {
-        println!("extract_entity = {:?}", request);
+        println!("extract_entity = {:#?}", request);
 
         let text : &str = request.get_ref().text.as_str();
         let ent_kinds : &Vec<String> = &request.get_ref().entity_kinds;
         let return_sentence : bool = request.get_ref().return_sentence;
+
+        println!("processing text ...\n", );
         let rusty_doc: rusty::Doc = handle_rusty_result_error!(self.rusty_nlp_model.nlp(text));
         let rusty_ents: Vec<rusty::Span> = handle_rusty_result_error!(rusty_doc.ents());
 
@@ -64,6 +65,7 @@ impl EntityExtractor for EntityExtractorService
             ).collect();
 
         let extract_entity_response = ExtractEntityResponse{ entity_refs : entity_refs };
+        println!("extract_entity_response:\n{extract_entity_response:#?}\n", );
 
         Ok(Response::new(extract_entity_response))
     }
@@ -73,22 +75,24 @@ impl EntityExtractor for EntityExtractorService
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>
 {
+    tokio::spawn(async move {tokio::signal::ctrl_c().await.unwrap(); std::process::exit(0); } );
+
     // using rusTy, rust wrapper of spaCy NLP engine
     let spacy_model_name = env::var("SPACY_MODEL_NAME").unwrap_or("en_core_web_sm".to_string());
-    println!("spacy_model_name: {spacy_model_name}");
+    println!("Loading spacy_model_name: {spacy_model_name} ...");
     let nlp = Language::load(spacy_model_name.as_str()).unwrap_or_else(
         |error|{ panic!("Failed loading spaCy model {}: {}", spacy_model_name, error) } );
     println!("Loaded spaCy model: {spacy_model_name}");
 
-    let extrent_rpc_addr_str: String = env::var("EXTRENT_RPC_ADDR").unwrap_or("[::1]:10000".to_string());
-    let extrent_rpc_addr : std::net::SocketAddr = extrent_rpc_addr_str.parse().unwrap(); 
-    println!("EntityExtractorServer listening on: {extrent_rpc_addr}");
+    let extrent_bind_addr_str: String = env::var("EXTRENT_BIND_ADDR").unwrap_or("127.0.0.1:8090".to_string());
+    let extrent_bind_addr : std::net::SocketAddr = extrent_bind_addr_str.parse().unwrap(); 
+    println!("EntityExtractorServer listening on: {extrent_bind_addr}");
 
     let entity_extractor = EntityExtractorService { rusty_nlp_model : Arc::new(nlp) };
 
     let svc = EntityExtractorServer::new(entity_extractor);
 
-    Server::builder().add_service(svc).serve(extrent_rpc_addr).await?;
+    Server::builder().add_service(svc).serve(extrent_bind_addr).await?;
 
     Ok(())
 }
